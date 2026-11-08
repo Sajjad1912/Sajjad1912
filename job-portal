@@ -1,1 +1,770 @@
+"""
+Job Portal Management System (Single-file Tkinter + SQLite3)
+Features implemented (approx):
+1. User Registration & Login System (Job Seeker / Employer)
+2. Admin Dashboard (manage users, jobs, feedbacks)
+3. Profile Management
+4. Job Posting Module
+5. Job Search & Filter
+6. Job Application System
+7. Resume Upload (stores path)
+8. View Applied Jobs
+9. Notification (simple matching alerts)
+10. SQLite3 DB backend
+11. Attractive-ish Tkinter GUI using ttk
+12. Data validation & error handling
+"""
+
+import os, sqlite3, hashlib, hmac, base64, uuid, shutil, ssl, smtplib
+from datetime import datetime
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from email.message import EmailMessage
+
+APP_DIR = Path("app_data")
+DB_PATH = APP_DIR / "app.db"
+RESUME_DIR = APP_DIR / "resumes"
+APP_DIR.mkdir(parents=True, exist_ok=True)
+RESUME_DIR.mkdir(parents=True, exist_ok=True)
+
+# -------------------- DB --------------------
+USE_FTS = True
+
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+def now_iso():
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+SCHEMA_BASE = """
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  password_hash BLOB NOT NULL,
+  role TEXT NOT NULL CHECK(role IN ('seeker','employer','admin')),
+  is_verified INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS seeker_profiles (
+  user_id INTEGER PRIMARY KEY,
+  name TEXT, phone TEXT, skills TEXT,
+  resume_path TEXT,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS employer_profiles (
+  user_id INTEGER PRIMARY KEY,
+  company TEXT NOT NULL, website TEXT, industry TEXT,
+  approved INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS jobs (
+  id INTEGER PRIMARY KEY,
+  employer_id INTEGER NOT NULL,
+  title TEXT NOT NULL, description TEXT NOT NULL,
+  location TEXT, type TEXT, experience TEXT,
+  salary_min INTEGER, salary_max INTEGER,
+  status TEXT NOT NULL DEFAULT 'draft',  -- draft|pending|approved|closed
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(employer_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS applications (
+  id INTEGER PRIMARY KEY,
+  job_id INTEGER NOT NULL,
+  seeker_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'submitted', -- submitted|under_review|shortlisted|interviewed|offered|rejected
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(job_id, seeker_id),
+  FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+  FOREIGN KEY(seeker_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  payload TEXT,
+  is_read INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id INTEGER PRIMARY KEY,
+  actor_id INTEGER,
+  action TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  entity_id INTEGER NOT NULL,
+  timestamp TEXT NOT NULL,
+  FOREIGN KEY(actor_id) REFERENCES users(id) ON DELETE SET NULL
+);
+"""
+
+SCHEMA_FTS = """
+CREATE VIRTUAL TABLE IF NOT EXISTS jobs_fts USING fts5(
+  title, description, content='jobs', content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS jobs_ai AFTER INSERT ON jobs BEGIN
+  INSERT INTO jobs_fts(rowid, title, description)
+  VALUES (new.id, new.title, new.description);
+END;
+
+CREATE TRIGGER IF NOT EXISTS jobs_au AFTER UPDATE ON jobs BEGIN
+  INSERT INTO jobs_fts(jobs_fts, rowid, title, description)
+    VALUES('delete', old.id, old.title, old.description);
+  INSERT INTO jobs_fts(rowid, title, description)
+    VALUES (new.id, new.title, new.description);
+END;
+
+CREATE TRIGGER IF NOT EXISTS jobs_ad AFTER DELETE ON jobs BEGIN
+  INSERT INTO jobs_fts(jobs_fts, rowid, title, description)
+    VALUES('delete', old.id, old.title, old.description);
+END;
+"""
+
+def init_db():
+    global USE_FTS
+    with get_conn() as conn:
+        conn.executescript(SCHEMA_BASE)
+        try:
+            conn.executescript(SCHEMA_FTS)
+            USE_FTS = True
+        except sqlite3.DatabaseError:
+            # FTS5 unavailable; fall back to LIKE search
+            USE_FTS = False
+
+# -------------------- Security --------------------
+def hash_password(password: str, *, rounds=200_000) -> str:
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, rounds)
+    return f"pbkdf2$sha256${rounds}${base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
+
+def verify_password(password: str, stored: str) -> bool:
+    algo, h, rounds, salt_b64, dk_b64 = stored.split('$')
+    salt = base64.b64decode(salt_b64)
+    expected = base64.b64decode(dk_b64)
+    dk = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, int(rounds))
+    return hmac.compare_digest(dk, expected)
+
+# -------------------- Email --------------------
+class Mailer:
+    def __init__(self, host="", port=587, user="", password=""):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+
+    def send(self, to_addr: str, subject: str, body: str):
+        if not self.host or not self.user or not self.password:
+            return  
+        msg = EmailMessage()
+        msg["From"] = self.user
+        msg["To"] = to_addr
+        msg["Subject"] = subject
+        msg.set_content(body)
+        context = ssl.create_default_context()
+        with smtplib.SMTP(self.host, self.port) as s:
+            s.starttls(context=context)
+            s.login(self.user, self.password)
+            s.send_message(msg)
+
+# -------------------- File Storage --------------------
+ALLOWED_EXT = {'.pdf', '.docx'}
+MAX_BYTES = 5 * 1024 * 1024
+
+def pick_and_store_resume(user_id: int) -> str:
+    path = filedialog.askopenfilename(title="Select resume")
+    if not path:
+        return ""
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in ALLOWED_EXT:
+        raise ValueError("Unsupported file type (pdf/docx)")
+    if os.path.getsize(path) > MAX_BYTES:
+        raise ValueError("File too large (max 5MB)")
+    dest_dir = RESUME_DIR / str(user_id)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{uuid.uuid4().hex}{ext}"
+    shutil.copy2(path, dest)
+    return str(dest)
+
+# -------------------- Data Access --------------------
+def create_user(email: str, password_hash: str, role: str) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO users(email,password_hash,role,is_verified,created_at) VALUES(?,?,?,?,?)",
+            (email, password_hash, role, 0, now_iso())
+        )
+        return cur.lastrowid
+
+def get_user_by_email(email: str):
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+
+def get_user(user_id: int):
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+
+def upsert_seeker_profile(user_id: int, name: str, phone: str, skills: str, resume_path: str):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO seeker_profiles(user_id,name,phone,skills,resume_path)
+               VALUES(?,?,?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 name=excluded.name, phone=excluded.phone, skills=excluded.skills, resume_path=excluded.resume_path""",
+            (user_id, name, phone, skills, resume_path)
+        )
+
+def get_seeker_profile(user_id: int):
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM seeker_profiles WHERE user_id=?", (user_id,)).fetchone()
+
+def upsert_employer_profile(user_id: int, company: str, website: str, industry: str):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO employer_profiles(user_id,company,website,industry,approved)
+               VALUES(?,?,?,?,0)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 company=excluded.company, website=excluded.website, industry=excluded.industry""",
+            (user_id, company, website, industry)
+        )
+
+def set_employer_approved(user_id: int, approved: int):
+    with get_conn() as conn:
+        conn.execute("UPDATE employer_profiles SET approved=? WHERE user_id=?", (approved, user_id))
+
+def create_job(employer_id: int, data: dict) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO jobs(employer_id,title,description,location,type,experience,salary_min,salary_max,status,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (employer_id, data["title"], data["description"], data.get("location"),
+             data.get("type"), data.get("experience"), data.get("salary_min"),
+             data.get("salary_max"), data.get("status","pending"), now_iso())
+        )
+        return cur.lastrowid
+
+def update_job(job_id: int, employer_id: int, data: dict):
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE jobs SET title=?, description=?, location=?, type=?, experience=?,
+                      salary_min=?, salary_max=?, status=?
+               WHERE id=? AND employer_id=?""",
+            (data["title"], data["description"], data.get("location"), data.get("type"),
+             data.get("experience"), data.get("salary_min"), data.get("salary_max"),
+             data.get("status","pending"), job_id, employer_id)
+        )
+
+def delete_job(job_id: int, employer_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM jobs WHERE id=? AND employer_id=?", (job_id, employer_id))
+
+def set_job_status(job_id: int, status: str):
+    with get_conn() as conn:
+        conn.execute("UPDATE jobs SET status=? WHERE id=?", (status, job_id))
+
+def list_jobs_by_employer(employer_id: int):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM jobs WHERE employer_id=? ORDER BY created_at DESC", (employer_id,)
+        ).fetchall()
+
+def search_jobs(q, type_, loc, min_sal, max_sal, approved_only=True, limit=50, offset=0):
+    with get_conn() as conn:
+        base = []
+        params = []
+        if approved_only:
+            base.append("j.status='approved'")
+        if type_:
+            base.append("j.type=?"); params.append(type_)
+        if loc:
+            base.append("j.location=?"); params.append(loc)
+        if min_sal is not None:
+            base.append("j.salary_min>=?"); params.append(min_sal)
+        if max_sal is not None:
+            base.append("j.salary_max<=?"); params.append(max_sal)
+        where = " AND ".join(base) if base else "1=1"
+        if q and USE_FTS:
+            sql = f"""
+              SELECT j.*
+              FROM jobs j
+              JOIN jobs_fts f ON f.rowid=j.id
+              WHERE f MATCH ? AND {where}
+              ORDER BY bm25(f) ASC
+              LIMIT ? OFFSET ?"""
+            return conn.execute(sql, (q, *params, limit, offset)).fetchall()
+        elif q:
+            sql = f"""
+              SELECT j.* FROM jobs j
+              WHERE (j.title LIKE ? OR j.description LIKE ?) AND {where}
+              ORDER BY j.created_at DESC
+              LIMIT ? OFFSET ?"""
+            like = f"%{q}%"
+            return conn.execute(sql, (like, like, *params, limit, offset)).fetchall()
+        else:
+            sql = f"SELECT * FROM jobs j WHERE {where} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            return conn.execute(sql, (*params, limit, offset)).fetchall()
+
+def apply_to_job(job_id: int, seeker_id: int) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO applications(job_id,seeker_id,status,created_at,updated_at) VALUES(?,?,?,?,?)",
+            (job_id, seeker_id, "submitted", now_iso(), now_iso())
+        )
+        return cur.lastrowid
+
+def update_application_status(app_id: int, new_status: str):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE applications SET status=?, updated_at=? WHERE id=?",
+            (new_status, now_iso(), app_id)
+        )
+
+def list_applications_for_job(job_id: int):
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT a.*, u.email seeker_email
+               FROM applications a
+               JOIN users u ON u.id=a.seeker_id
+               WHERE a.job_id=?
+               ORDER BY a.created_at DESC""",
+            (job_id,)
+        ).fetchall()
+
+def list_applications_for_seeker(seeker_id: int):
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT a.*, j.title job_title
+               FROM applications a
+               JOIN jobs j ON j.id=a.job_id
+               WHERE a.seeker_id=?
+               ORDER BY a.created_at DESC""",
+            (seeker_id,)
+        ).fetchall()
+
+def add_notification(user_id: int, type_: str, payload: str):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO notifications(user_id,type,payload,is_read,created_at) VALUES(?,?,?,?,?)",
+            (user_id, type_, payload, 0, now_iso())
+        )
+
+def list_notifications(user_id: int):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC", (user_id,)
+        ).fetchall()
+
+def add_audit(actor_id: int, action: str, entity_type: str, entity_id: int):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO audit_logs(actor_id,action,entity_type,entity_id,timestamp) VALUES(?,?,?,?,?)",
+            (actor_id, action, entity_type, entity_id, now_iso())
+        )
+
+def employer_metrics(employer_id: int):
+    with get_conn() as conn:
+        active_jobs = conn.execute(
+            "SELECT COUNT(*) c FROM jobs WHERE employer_id=? AND status='approved'", (employer_id,)
+        ).fetchone()["c"]
+        new_apps = conn.execute(
+            "SELECT COUNT(*) c FROM applications a JOIN jobs j ON j.id=a.job_id WHERE j.employer_id=? AND a.created_at>=datetime('now','-7 days')",
+            (employer_id,)
+        ).fetchone()["c"]
+        total_apps = conn.execute(
+            "SELECT COUNT(*) c FROM applications a JOIN jobs j ON j.id=a.job_id WHERE j.employer_id=?",
+            (employer_id,)
+        ).fetchone()["c"]
+        shortlisted = conn.execute(
+            "SELECT COUNT(*) c FROM applications a JOIN jobs j ON j.id=a.job_id WHERE j.employer_id=? AND a.status='shortlisted'",
+            (employer_id,)
+        ).fetchone()["c"]
+        rate = (shortlisted / total_apps) if total_apps else 0
+        return active_jobs, new_apps, rate
+
+def seeker_metrics(seeker_id: int):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) c FROM applications WHERE seeker_id=? GROUP BY status", (seeker_id,)
+        ).fetchall()
+        return {r["status"]: r["c"] for r in rows}
+
+# -------------------- Session --------------------
+class Session:
+    def __init__(self):
+        self.user = None
+        self.mailer = Mailer()
+
+session = Session()
+
+# -------------------- UI --------------------
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Job Portal - Tkinter + SQLite")
+        self.geometry("1080x720")
+        container = ttk.Frame(self)
+        container.pack(fill="both", expand=True)
+        self.frames = {}
+        for F in (LoginFrame, RegisterSeekerFrame, RegisterEmployerFrame,
+                  SeekerDashboard, EmployerDashboard, AdminDashboard,
+                  SearchFrame, EmployerJobForm, SettingsFrame):
+            frame = F(container, self)
+            self.frames[F.__name__] = frame
+            frame.grid(row=0, column=0, sticky="nsew")
+        self.show("LoginFrame")
+
+    def show(self, name):
+        frame = self.frames[name]
+        frame.tkraise()
+        if hasattr(frame, "on_show"):
+            frame.on_show()
+
+# ---------- Auth ----------
+class LoginFrame(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent)
+        self.ctrl = ctrl
+        ttk.Label(self, text="Email").grid(row=0, column=0, sticky="w")
+        ttk.Label(self, text="Password").grid(row=1, column=0, sticky="w")
+        self.email = ttk.Entry(self, width=40); self.email.grid(row=0, column=1)
+        self.pw = ttk.Entry(self, width=40, show="*"); self.pw.grid(row=1, column=1)
+        ttk.Button(self, text="Login", command=self.login).grid(row=2, column=0, pady=8, sticky="w")
+        ttk.Button(self, text="Register Seeker", command=lambda: ctrl.show("RegisterSeekerFrame")).grid(row=2, column=1, sticky="w")
+        ttk.Button(self, text="Register Employer", command=lambda: ctrl.show("RegisterEmployerFrame")).grid(row=2, column=1, sticky="e")
+        ttk.Button(self, text="Seed Admin", command=self.seed_admin).grid(row=3, column=0, pady=4, sticky="w")
+        ttk.Button(self, text="Settings", command=lambda: ctrl.show("SettingsFrame")).grid(row=3, column=1, sticky="e")
+
+    def seed_admin(self):
+        if get_user_by_email("admin@example.com"):
+            messagebox.showinfo("Info", "Admin already exists.")
+            return
+        uid = create_user("admin@example.com", hash_password("admin123"), "admin")
+        messagebox.showinfo("OK", f"Admin created: admin@example.com / admin123 (id={uid})")
+
+    def login(self):
+        u = get_user_by_email(self.email.get().strip())
+        if not u:
+            messagebox.showerror("Error", "User not found"); return
+        if not verify_password(self.pw.get(), u["password_hash"]):
+            messagebox.showerror("Error", "Invalid credentials"); return
+        session.user = u
+        if u["role"] == "seeker":
+            self.ctrl.show("SeekerDashboard")
+        elif u["role"] == "employer":
+            self.ctrl.show("EmployerDashboard")
+        else:
+            self.ctrl.show("AdminDashboard")
+
+class RegisterSeekerFrame(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent); self.ctrl = ctrl
+        self.e_email = ttk.Entry(self, width=40)
+        self.e_pw = ttk.Entry(self, width=40, show="*")
+        self.e_name = ttk.Entry(self, width=40)
+        self.e_phone = ttk.Entry(self, width=40)
+        self.e_skills = ttk.Entry(self, width=60)
+        row = 0
+        for label, widget in [
+            ("Email", self.e_email), ("Password", self.e_pw),
+            ("Name", self.e_name), ("Phone", self.e_phone),
+            ("Skills (comma separated)", self.e_skills)
+        ]:
+            ttk.Label(self, text=label).grid(row=row, column=0, sticky="w"); widget.grid(row=row, column=1, sticky="ew"); row += 1
+        ttk.Button(self, text="Register", command=self.register).grid(row=row, column=0, pady=8)
+        ttk.Button(self, text="Back", command=lambda: ctrl.show("LoginFrame")).grid(row=row, column=1, sticky="e")
+
+    def register(self):
+        email = self.e_email.get().strip()
+        if get_user_by_email(email):
+            messagebox.showerror("Error", "Email already registered"); return
+        uid = create_user(email, hash_password(self.e_pw.get()), "seeker")
+        upsert_seeker_profile(uid, self.e_name.get(), self.e_phone.get(), self.e_skills.get(), "")
+        messagebox.showinfo("OK", "Seeker registered. Please login.")
+        self.ctrl.show("LoginFrame")
+
+class RegisterEmployerFrame(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent); self.ctrl = ctrl
+        self.e_email = ttk.Entry(self, width=40)
+        self.e_pw = ttk.Entry(self, width=40, show="*")
+        self.e_company = ttk.Entry(self, width=40)
+        self.e_site = ttk.Entry(self, width=40)
+        self.e_industry = ttk.Entry(self, width=40)
+        row = 0
+        for label, widget in [
+            ("Email", self.e_email), ("Password", self.e_pw),
+            ("Company", self.e_company), ("Website", self.e_site), ("Industry", self.e_industry)
+        ]:
+            ttk.Label(self, text=label).grid(row=row, column=0, sticky="w"); widget.grid(row=row, column=1, sticky="ew"); row += 1
+        ttk.Button(self, text="Register", command=self.register).grid(row=row, column=0, pady=8)
+        ttk.Button(self, text="Back", command=lambda: ctrl.show("LoginFrame")).grid(row=row, column=1, sticky="e")
+
+    def register(self):
+        email = self.e_email.get().strip()
+        if get_user_by_email(email):
+            messagebox.showerror("Error", "Email already registered"); return
+        uid = create_user(email, hash_password(self.e_pw.get()), "employer")
+        upsert_employer_profile(uid, self.e_company.get(), self.e_site.get(), self.e_industry.get())
+        messagebox.showinfo("OK", "Employer registered. Await admin approval before posting jobs.")
+        self.ctrl.show("LoginFrame")
+
+# ---------- Settings ----------
+class SettingsFrame(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent); self.ctrl = ctrl
+        ttk.Label(self, text="SMTP Host").grid(row=0, column=0, sticky="w")
+        ttk.Label(self, text="SMTP Port").grid(row=1, column=0, sticky="w")
+        ttk.Label(self, text="SMTP User (From)").grid(row=2, column=0, sticky="w")
+        ttk.Label(self, text="SMTP Password").grid(row=3, column=0, sticky="w")
+        self.host = ttk.Entry(self, width=40); self.host.grid(row=0, column=1)
+        self.port = ttk.Entry(self, width=40); self.port.insert(0, "587"); self.port.grid(row=1, column=1)
+        self.user = ttk.Entry(self, width=40); self.user.grid(row=2, column=1)
+        self.pw = ttk.Entry(self, width=40, show="*"); self.pw.grid(row=3, column=1)
+        ttk.Button(self, text="Save", command=self.save).grid(row=4, column=0, pady=8)
+        ttk.Button(self, text="Back", command=lambda: ctrl.show("LoginFrame")).grid(row=4, column=1, sticky="e")
+
+    def save(self):
+        try:
+            session.mailer = Mailer(self.host.get(), int(self.port.get()), self.user.get(), self.pw.get())
+            messagebox.showinfo("OK", "SMTP settings saved.")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+# ---------- Seeker ----------
+class SeekerDashboard(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent); self.ctrl = ctrl
+        top = ttk.Frame(self); top.grid(row=0, column=0, sticky="ew")
+        ttk.Button(top, text="Search Jobs", command=lambda: ctrl.show("SearchFrame")).pack(side="left", padx=4, pady=4)
+        ttk.Button(top, text="Edit Profile", command=self.edit_profile).pack(side="left", padx=4, pady=4)
+        self.metrics_lbl = ttk.Label(top, text=""); self.metrics_lbl.pack(side="right", padx=8)
+        self.tree = ttk.Treeview(self, columns=("job","status","updated"), show="headings", height=20)
+        for c, t in zip(("job","status","updated"), ("Job","Status","Updated")):
+            self.tree.heading(c, text=t)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        self.grid_rowconfigure(1, weight=1); self.grid_columnconfigure(0, weight=1)
+
+    def on_show(self): self.refresh()
+
+    def refresh(self):
+        for r in self.tree.get_children(): self.tree.delete(r)
+        apps = list_applications_for_seeker(session.user["id"])
+        for a in apps:
+            self.tree.insert("", "end", values=(a["job_title"], a["status"], a["updated_at"]))
+        m = seeker_metrics(session.user["id"])
+        self.metrics_lbl.config(text=" | ".join([f"{k}:{v}" for k,v in m.items()]))
+
+    def edit_profile(self):
+        top = tk.Toplevel(self); top.title("Seeker Profile")
+        name = ttk.Entry(top, width=40); phone = ttk.Entry(top, width=40); skills = ttk.Entry(top, width=60)
+        ttk.Label(top, text="Name").grid(row=0, column=0, sticky="w"); name.grid(row=0, column=1)
+        ttk.Label(top, text="Phone").grid(row=1, column=0, sticky="w"); phone.grid(row=1, column=1)
+        ttk.Label(top, text="Skills").grid(row=2, column=0, sticky="w"); skills.grid(row=2, column=1)
+        def save():
+            upsert_seeker_profile(session.user["id"], name.get(), phone.get(), skills.get(), "")
+            messagebox.showinfo("OK", "Profile saved"); top.destroy()
+        def upload():
+            try:
+                path = pick_and_store_resume(session.user["id"])
+                prof = get_seeker_profile(session.user["id"])
+                upsert_seeker_profile(session.user["id"], name.get() or (prof["name"] if prof else ""),
+                                      phone.get() or (prof["phone"] if prof else ""),
+                                      skills.get() or (prof["skills"] if prof else ""), path)
+                messagebox.showinfo("OK", "Resume uploaded")
+            except Exception as e:
+                messagebox.showerror("Upload error", str(e))
+        ttk.Button(top, text="Upload Resume", command=upload).grid(row=3, column=0, pady=6)
+        ttk.Button(top, text="Save", command=save).grid(row=3, column=1, pady=6)
+
+# ---------- Employer ----------
+class EmployerDashboard(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent); self.ctrl = ctrl
+        top = ttk.Frame(self); top.grid(row=0, column=0, sticky="ew")
+        ttk.Button(top, text="New Job", command=lambda: ctrl.show("EmployerJobForm")).pack(side="left", padx=4, pady=4)
+        ttk.Button(top, text="Refresh", command=self.refresh).pack(side="left", padx=4, pady=4)
+        self.metrics_lbl = ttk.Label(top, text=""); self.metrics_lbl.pack(side="right", padx=8)
+        self.tree = ttk.Treeview(self, columns=("id","title","status","created"), show="headings", height=18)
+        for c in ("id","title","status","created"):
+            self.tree.heading(c, text=c.capitalize())
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        self.grid_rowconfigure(1, weight=1); self.grid_columnconfigure(0, weight=1)
+        btns = ttk.Frame(self); btns.grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Button(btns, text="Open Applications", command=self.open_apps).pack(side="left", padx=4)
+        ttk.Button(btns, text="Mark Pending (request approval)", command=self.request_approve).pack(side="left", padx=4)
+
+    def on_show(self): self.refresh()
+
+    def refresh(self):
+        for r in self.tree.get_children(): self.tree.delete(r)
+        rows = list_jobs_by_employer(session.user["id"])
+        for j in rows:
+            self.tree.insert("", "end", values=(j["id"], j["title"], j["status"], j["created_at"]))
+        a, n, rate = employer_metrics(session.user["id"])
+        self.metrics_lbl.config(text=f"Active:{a} | New apps(7d):{n} | Shortlist rate:{rate:.2f}")
+
+    def open_apps(self):
+        sel = self.tree.selection() 
+        if not sel: return
+        job_id = int(self.tree.item(sel[0], "values")[0])
+        top = tk.Toplevel(self); top.title(f"Applications for Job #{job_id}")
+        tree = ttk.Treeview(top, columns=("id","seeker","status","created"), show="headings", height=20)
+        for c in ("id","seeker","status","created"):
+            tree.heading(c, text=c.capitalize())
+        tree.pack(fill="both", expand=True)
+        def reload():
+            for r in tree.get_children(): tree.delete(r)
+            for a in list_applications_for_job(job_id):
+                tree.insert("", "end", values=(a["id"], a["seeker_email"], a["status"], a["created_at"]))
+        def shortlist():
+            sel2 = tree.selection()
+            if not sel2: return
+            app_id = int(tree.item(sel2[0], "values")[0])
+            update_application_status(app_id, "shortlisted")
+            reload()
+        ttk.Button(top, text="Refresh", command=reload).pack(side="left", padx=4, pady=4)
+        ttk.Button(top, text="Shortlist", command=shortlist).pack(side="left", padx=4, pady=4)
+        reload()
+
+    def request_approve(self):
+        sel = self.tree.selection()
+        if not sel: return
+        job_id = int(self.tree.item(sel[0], "values")[0])
+        set_job_status(job_id, "pending")
+        messagebox.showinfo("OK", "Job marked as pending admin approval.")
+
+class EmployerJobForm(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent); self.ctrl = ctrl
+        self.inputs = {}
+        fields = ["title","description","location","type","experience","salary_min","salary_max"]
+        for i, f in enumerate(fields):
+            ttk.Label(self, text=f.capitalize()).grid(row=i, column=0, sticky="w")
+            e = ttk.Entry(self, width=60)
+            if f == "description":
+                e = ttk.Entry(self, width=80)
+            e.grid(row=i, column=1, sticky="ew"); self.inputs[f] = e
+        ttk.Button(self, text="Create", command=self.create).grid(row=len(fields), column=0, pady=8)
+        ttk.Button(self, text="Back", command=lambda: ctrl.show("EmployerDashboard")).grid(row=len(fields), column=1, sticky="e")
+
+    def create(self):
+        data = {k: v.get() for k, v in self.inputs.items()}
+        for k in ("salary_min","salary_max"):
+            data[k] = int(data[k]) if data[k] else None
+        data["status"] = "pending"
+        create_job(session.user["id"], data)
+        messagebox.showinfo("OK", "Job created (pending admin approval).")
+        self.ctrl.show("EmployerDashboard")
+
+# ---------- Admin ----------
+class AdminDashboard(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent); self.ctrl = ctrl
+        ttk.Label(self, text="Employers Pending Approval").grid(row=0, column=0, sticky="w")
+        self.emp = ttk.Treeview(self, columns=("id","email","company","approved"), show="headings"); 
+        for c in ("id","email","company","approved"): self.emp.heading(c, text=c.capitalize())
+        self.emp.grid(row=1, column=0, sticky="nsew")
+        ttk.Label(self, text="Jobs Pending Approval").grid(row=0, column=1, sticky="w")
+        self.jobs = ttk.Treeview(self, columns=("id","title","employer_id"), show="headings")
+        for c in ("id","title","employer_id"): self.jobs.heading(c, text=c.capitalize())
+        self.jobs.grid(row=1, column=1, sticky="nsew")
+        self.grid_rowconfigure(1, weight=1); self.grid_columnconfigure(0, weight=1); self.grid_columnconfigure(1, weight=1)
+        btns = ttk.Frame(self); btns.grid(row=2, column=0, columnspan=2, pady=6)
+        ttk.Button(btns, text="Approve Employer", command=self.approve_emp).pack(side="left", padx=4)
+        ttk.Button(btns, text="Approve Job", command=self.approve_job).pack(side="left", padx=4)
+        ttk.Button(btns, text="Refresh", command=self.refresh).pack(side="left", padx=4)
+
+    def on_show(self): self.refresh()
+
+    def refresh(self):
+        for r in self.emp.get_children(): self.emp.delete(r)
+        for r in self.jobs.get_children(): self.jobs.delete(r)
+        with get_conn() as conn:
+            for row in conn.execute("""SELECT u.id,u.email,ep.company,ep.approved
+                                       FROM users u JOIN employer_profiles ep ON ep.user_id=u.id
+                                       WHERE u.role='employer' AND ep.approved=0"""):
+                self.emp.insert("", "end", values=(row["id"], row["email"], row["company"], row["approved"]))
+            for row in conn.execute("""SELECT id,title,employer_id FROM jobs WHERE status='pending'"""):
+                self.jobs.insert("", "end", values=(row["id"], row["title"], row["employer_id"]))
+
+    def approve_emp(self):
+        sel = self.emp.selection()
+        if not sel: return
+        emp_id = int(self.emp.item(sel[0], "values")[0])
+        set_employer_approved(emp_id, 1)
+        self.refresh()
+
+    def approve_job(self):
+        sel = self.jobs.selection()
+        if not sel: return
+        job_id = int(self.jobs.item(sel[0], "values")[0])
+        set_job_status(job_id, "approved")
+        self.refresh()
+
+# ---------- Search / Apply ----------
+class SearchFrame(ttk.Frame):
+    def __init__(self, parent, ctrl):
+        super().__init__(parent); self.ctrl = ctrl
+        self.q = ttk.Entry(self, width=50)
+        self.type_ = ttk.Entry(self, width=20)
+        self.loc = ttk.Entry(self, width=20)
+        self.min_sal = ttk.Entry(self, width=10)
+        self.max_sal = ttk.Entry(self, width=10)
+        ttk.Label(self, text="Keywords").grid(row=0, column=0, sticky="w"); self.q.grid(row=0, column=1, sticky="w")
+        ttk.Label(self, text="Type").grid(row=0, column=2, sticky="w"); self.type_.grid(row=0, column=3, sticky="w")
+        ttk.Label(self, text="Location").grid(row=0, column=4, sticky="w"); self.loc.grid(row=0, column=5, sticky="w")
+        ttk.Label(self, text="Min").grid(row=0, column=6, sticky="w"); self.min_sal.grid(row=0, column=7, sticky="w")
+        ttk.Label(self, text="Max").grid(row=0, column=8, sticky="w"); self.max_sal.grid(row=0, column=9, sticky="w")
+        ttk.Button(self, text="Search", command=self.search).grid(row=0, column=10, padx=6)
+        ttk.Button(self, text="Back", command=lambda: ctrl.show("SeekerDashboard")).grid(row=0, column=11, padx=6)
+        self.tree = ttk.Treeview(self, columns=("id","title","location","type","salary_min","salary_max","status"), show="headings", height=22)
+        for c in ("id","title","location","type","salary_min","salary_max","status"):
+            self.tree.heading(c, text=c.capitalize())
+        self.tree.grid(row=1, column=0, columnspan=12, sticky="nsew")
+        self.grid_rowconfigure(1, weight=1)
+        ttk.Button(self, text="Apply", command=self.apply).grid(row=2, column=0, pady=6)
+
+    def search(self):
+        for r in self.tree.get_children(): self.tree.delete(r)
+        try:
+            rows = search_jobs(
+                self.q.get().strip() or None,
+                self.type_.get().strip() or None,
+                self.loc.get().strip() or None,
+                int(self.min_sal.get().strip()) if self.min_sal.get().strip() else None,
+                int(self.max_sal.get().strip()) if self.max_sal.get().strip() else None,
+                approved_only=True
+            )
+            for j in rows:
+                self.tree.insert("", "end", values=(j["id"], j["title"], j["location"], j["type"], j["salary_min"], j["salary_max"], j["status"]))
+        except Exception as e:
+            messagebox.showerror("Search error", str(e))
+
+    def apply(self):
+        sel = self.tree.selection()
+        if not sel: return
+        job_id = int(self.tree.item(sel[0], "values")[0])
+        try:
+            apply_to_job(job_id, session.user["id"])
+            add_notification(session.user["id"], "application_submitted", f"job:{job_id}")
+            messagebox.showinfo("OK", "Application submitted.")
+        except Exception as e:
+            messagebox.showerror("Apply error", str(e))
+
+# -------------------- Main --------------------
+if __name__ == "__main__":
+    init_db()
+    app = App()
+    app.mainloop()
 
